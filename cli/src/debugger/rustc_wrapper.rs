@@ -39,15 +39,40 @@ pub fn rewrite_args(args: &[String], cwd: &str) -> Vec<String> {
     for arg in args {
         if let Some(path) = arg.strip_prefix('@') {
             if let Ok(content) = fs::read_to_string(path) {
+                let mut new_content = String::new();
+                let mut modified = false;
+
                 // Filter out empty lines to prevent rustc from failing on "" arguments
                 for line in content.lines().filter(|l| !l.trim().is_empty()) {
                     if line == "-Zremap-cwd-prefix=" {
-                        rewritten.push(format!("-Zremap-cwd-prefix={cwd}"));
+                        new_content.push_str(&format!("-Zremap-cwd-prefix={cwd}\n"));
+                        modified = true;
                     } else {
-                        rewritten.push(line.to_string());
+                        new_content.push_str(line);
+                        new_content.push('\n');
                     }
                 }
-                continue;
+
+                if modified {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let time = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let temp_file = std::env::temp_dir().join(format!(
+                        "anchor_argfile_{}_{}.txt",
+                        process::id(),
+                        time
+                    ));
+
+                    if fs::write(&temp_file, &new_content).is_ok() {
+                        rewritten.push(format!("@{}", temp_file.display()));
+                        continue;
+                    }
+                } else {
+                    rewritten.push(arg.clone());
+                    continue;
+                }
             }
         }
 
@@ -101,15 +126,21 @@ mod tests {
     use {super::*, tempfile::tempdir};
 
     #[test]
-    fn argfile_blank_lines_are_dropped() {
+    fn test_argfile_rewrite() {
         let tmp = tempdir().unwrap();
         let argfile = tmp.path().join("args");
         fs::write(&argfile, "--crate-name\nfoo\n\n-Zremap-cwd-prefix=\n").unwrap();
 
         let args = vec![format!("@{}", argfile.display())];
+        let rewritten = rewrite_args(&args, "/workspace");
+
+        assert_eq!(rewritten.len(), 1);
+        assert!(rewritten[0].starts_with('@'));
+
+        let new_content = fs::read_to_string(&rewritten[0][1..]).unwrap();
         assert_eq!(
-            rewrite_args(&args, "/workspace"),
-            vec!["--crate-name", "foo", "-Zremap-cwd-prefix=/workspace"],
+            new_content,
+            "--crate-name\nfoo\n-Zremap-cwd-prefix=/workspace\n"
         );
     }
 }
