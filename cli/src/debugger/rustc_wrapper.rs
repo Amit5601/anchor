@@ -27,15 +27,18 @@
 //! The wrapper adds ~1ms of fork+exec overhead per rustc invocation.
 //! This is negligible compared to actual compilation time.
 
-use std::{fs, process};
+use std::{fs, io::Write, process};
+use tempfile::NamedTempFile;
 
 /// Env var set by `anchor debugger` before calling `cargo build-sbf`.
 /// When present, the process knows it was invoked as a RUSTC_WRAPPER
 /// and should rewrite args instead of running the normal CLI.
 pub const WRAPPER_SENTINEL: &str = "__ANCHOR_RUSTC_WRAPPER";
 
-pub fn rewrite_args(args: &[String], cwd: &str) -> Vec<String> {
+pub fn rewrite_args(args: &[String], cwd: &str) -> (Vec<String>, Vec<NamedTempFile>) {
     let mut rewritten = Vec::new();
+    let mut temp_files = Vec::new();
+
     for arg in args {
         if let Some(path) = arg.strip_prefix('@') {
             if let Ok(content) = fs::read_to_string(path) {
@@ -54,20 +57,13 @@ pub fn rewrite_args(args: &[String], cwd: &str) -> Vec<String> {
                 }
 
                 if modified {
-                    use std::time::{SystemTime, UNIX_EPOCH};
-                    let time = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos();
-                    let temp_file = std::env::temp_dir().join(format!(
-                        "anchor_argfile_{}_{}.txt",
-                        process::id(),
-                        time
-                    ));
-
-                    if fs::write(&temp_file, &new_content).is_ok() {
-                        rewritten.push(format!("@{}", temp_file.display()));
-                        continue;
+                    if let Ok(mut temp_file) = NamedTempFile::new() {
+                        if temp_file.write_all(new_content.as_bytes()).is_ok() {
+                            rewritten.push(format!("@{}", temp_file.path().display()));
+                            // Keep the handle alive so the file isn't deleted prematurely
+                            temp_files.push(temp_file);
+                            continue;
+                        }
                     }
                 } else {
                     rewritten.push(arg.clone());
@@ -82,7 +78,7 @@ pub fn rewrite_args(args: &[String], cwd: &str) -> Vec<String> {
             rewritten.push(arg.clone());
         }
     }
-    rewritten
+    (rewritten, temp_files)
 }
 
 /// If we're running as a RUSTC_WRAPPER (sentinel env var is set),
@@ -108,7 +104,7 @@ pub fn maybe_exec_as_wrapper() -> bool {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 
-    let rewritten = rewrite_args(&args[2..], &cwd);
+    let (rewritten, _temp_files) = rewrite_args(&args[2..], &cwd);
 
     let status = process::Command::new(rustc)
         .args(&rewritten)
@@ -123,24 +119,21 @@ pub fn maybe_exec_as_wrapper() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, tempfile::tempdir};
+    use super::*;
 
     #[test]
     fn test_argfile_rewrite() {
-        let tmp = tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
         let argfile = tmp.path().join("args");
         fs::write(&argfile, "--crate-name\nfoo\n\n-Zremap-cwd-prefix=\n").unwrap();
 
         let args = vec![format!("@{}", argfile.display())];
-        let rewritten = rewrite_args(&args, "/workspace");
+        let (rewritten, _temp_files) = rewrite_args(&args, "/workspace");
 
         assert_eq!(rewritten.len(), 1);
         assert!(rewritten[0].starts_with('@'));
 
         let new_content = fs::read_to_string(&rewritten[0][1..]).unwrap();
-        assert_eq!(
-            new_content,
-            "--crate-name\nfoo\n-Zremap-cwd-prefix=/workspace\n"
-        );
+        assert_eq!(new_content, "--crate-name\nfoo\n-Zremap-cwd-prefix=/workspace\n");
     }
 }
