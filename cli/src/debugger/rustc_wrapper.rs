@@ -27,8 +27,10 @@
 //! The wrapper adds ~1ms of fork+exec overhead per rustc invocation.
 //! This is negligible compared to actual compilation time.
 
-use std::{fs, io::Write, process};
-use tempfile::NamedTempFile;
+use {
+    std::{fs, io::Write, process},
+    tempfile::NamedTempFile,
+};
 
 /// Env var set by `anchor debugger` before calling `cargo build-sbf`.
 /// When present, the process knows it was invoked as a RUSTC_WRAPPER
@@ -106,15 +108,17 @@ pub fn maybe_exec_as_wrapper() -> bool {
 
     let (rewritten, _temp_files) = rewrite_args(&args[2..], &cwd);
 
-    let status = process::Command::new(rustc)
-        .args(&rewritten)
-        .status()
-        .unwrap_or_else(|e| {
+    let result = process::Command::new(rustc).args(&rewritten).status();
+
+    drop(_temp_files);
+
+    match result {
+        Ok(status) => process::exit(status.code().unwrap_or(1)),
+        Err(e) => {
             eprintln!("anchor rustc-wrapper: failed to exec {rustc}: {e}");
             process::exit(1);
-        });
-
-    process::exit(status.code().unwrap_or(1));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +138,9 @@ mod tests {
         assert!(rewritten[0].starts_with('@'));
 
         let new_content = fs::read_to_string(&rewritten[0][1..]).unwrap();
-        assert_eq!(new_content, "--crate-name\nfoo\n-Zremap-cwd-prefix=/workspace\n");
+        assert_eq!(
+            new_content,
+            "--crate-name\nfoo\n-Zremap-cwd-prefix=/workspace\n"
+        );
     }
 }
